@@ -8,8 +8,7 @@ import os
 import socket
 import datetime
 import io
-import qrcode
-from PIL import Image
+
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -114,11 +113,209 @@ def get_local_ip():
             return "127.0.0.1"
 
 # ── QR Code ───────────────────────────────────────────────────────────────────
-def generate_qr(url: str) -> Image.Image:
-    qr = qrcode.QRCode(box_size=6, border=3)
-    qr.add_data(url)
-    qr.make(fit=True)
-    return qr.make_image(fill_color="#f59e0b", back_color="#0a0e1a")
+def generate_qr_svg(url: str) -> str:
+    """Generate a QR Code as inline SVG using only stdlib (no qrcode/Pillow)."""
+    import base64, struct, zlib
+
+    # ── Minimal QR encoder (Model 2, byte mode, ECC=M) ──────────────────────
+    # We use Python's built-in segno-free approach via the 'qrcode' stdlib
+    # alternative: encode via a data-URI that embeds a Google Charts call
+    # (offline fallback: pure matrix via bit-manipulation)
+    # For true offline pure-stdlib, we embed a tiny Reed-Solomon QR engine.
+
+    # ── Use segno if available, else fallback to URL-encoded SVG placeholder ─
+    try:
+        import segno
+        qr = segno.make(url, error="m")
+        buf = io.StringIO()
+        qr.save(buf, kind="svg", dark="#f59e0b", light="#0a0e1a", scale=4, border=2)
+        return buf.getvalue()
+    except ImportError:
+        pass
+
+    # ── Pure stdlib fallback: tiny QR via Reed-Solomon ───────────────────────
+    # We implement a minimal version sufficient for short URLs (<80 chars)
+    def _rs_encode(data, nsym):
+        """Reed-Solomon encoding over GF(256) with primitive poly 0x11d."""
+        gen = [1]
+        for i in range(nsym):
+            gen = _poly_mult(gen, [1, _gf_pow(2, i)])
+        msg = list(data) + [0] * nsym
+        for i in range(len(data)):
+            coef = msg[i]
+            if coef:
+                for j in range(1, len(gen)):
+                    msg[i+j] ^= _gf_mult(gen[j], coef)
+        return msg[len(data):]
+
+    gf_exp = [1] * 512
+    gf_log = [0] * 256
+    x = 1
+    for i in range(1, 255):
+        x = (x << 1) ^ (0x11d if x & 0x80 else 0)
+        x &= 0xff
+        gf_exp[i] = x
+        gf_log[x] = i
+    for i in range(255, 512):
+        gf_exp[i] = gf_exp[i - 255]
+
+    def _gf_pow(x, p): return gf_exp[(gf_log[x] * p) % 255] if x else 0
+    def _gf_mult(x, y): return gf_exp[(gf_log[x] + gf_log[y]) % 255] if x and y else 0
+    def _poly_mult(p, q):
+        r = [0] * (len(p) + len(q) - 1)
+        for i, pi in enumerate(p):
+            for j, qj in enumerate(q):
+                r[i+j] ^= _gf_mult(pi, qj)
+        return r
+
+    # Encode URL as QR version 3-M (29×29) – handles up to ~47 bytes cleanly
+    # For longer URLs, silently truncate display (show a notice instead)
+    url_b = url.encode("utf-8")
+    if len(url_b) > 47:
+        # Too long for our minimal encoder: render a text notice
+        svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='160' height='60'>
+  <rect width='160' height='60' fill='#0a0e1a' rx='6'/>
+  <text x='80' y='22' fill='#f59e0b' font-size='11' font-family='monospace' text-anchor='middle'>QR non disponible</text>
+  <text x='80' y='40' fill='#9ca3af' font-size='9' font-family='monospace' text-anchor='middle'>URL trop longue</text>
+  <text x='80' y='54' fill='#6b7280' font-size='8' font-family='monospace' text-anchor='middle'>pip install segno</text>
+</svg>"""
+        return svg
+
+    # Version 3-M: 29×29, 2 blocks, 15 EC codewords per block
+    SIZE = 29
+    # Data capacity: 36 data codewords for version 3-M byte mode
+    n = len(url_b)
+    # Bit stream: mode=0100 (byte), char count (8 bits), data, terminator
+    bits = []
+    def add_bits(val, nb):
+        for i in range(nb-1, -1, -1):
+            bits.append((val >> i) & 1)
+
+    add_bits(0b0100, 4)   # byte mode
+    add_bits(n, 8)         # char count
+    for byte in url_b:
+        add_bits(byte, 8)
+    add_bits(0, 4)         # terminator
+
+    # Pad to 288 bits (36 bytes)
+    while len(bits) % 8: bits.append(0)
+    pad_bytes = [0xEC, 0x11]
+    i = 0
+    while len(bits) < 288:
+        add_bits(pad_bytes[i % 2], 8)
+        i += 1
+
+    # Convert bits to bytes
+    data_cw = [0]*36
+    for i in range(36):
+        for b in range(8):
+            data_cw[i] = (data_cw[i] << 1) | bits[i*8+b]
+
+    # Version 3-M: 2 blocks, 15 EC each
+    half = 18
+    ec1 = _rs_encode(data_cw[:half], 15)
+    ec2 = _rs_encode(data_cw[half:], 15)
+    codewords = data_cw[:half] + data_cw[half:] + ec1 + ec2
+
+    # Interleave (version 3-M blocks already interleaved above)
+    # Place into bit stream for matrix
+    all_bits = []
+    for cw in codewords:
+        for i in range(7, -1, -1):
+            all_bits.append((cw >> i) & 1)
+
+    # ── Build matrix ──────────────────────────────────────────────────────────
+    mat = [[0]*SIZE for _ in range(SIZE)]
+    func = [[False]*SIZE for _ in range(SIZE)]  # functional modules
+
+    def set_func(r, c, v):
+        if 0 <= r < SIZE and 0 <= c < SIZE:
+            mat[r][c] = v; func[r][c] = True
+
+    # Finder patterns
+    def finder(r, c):
+        for dr in range(-1, 8):
+            for dc in range(-1, 8):
+                if 0 <= r+dr < SIZE and 0 <= c+dc < SIZE:
+                    inside = 0<=dr<=6 and 0<=dc<=6
+                    v = 0
+                    if inside:
+                        if dr in(0,6) or dc in(0,6): v=1
+                        elif dr in(1,5) or dc in(1,5): v=0
+                        else: v=1
+                    set_func(r+dr, c+dc, v)
+
+    finder(0,0); finder(0,SIZE-7); finder(SIZE-7,0)
+
+    # Timing
+    for i in range(8, SIZE-8):
+        set_func(6, i, 1 if i%2==0 else 0)
+        set_func(i, 6, 1 if i%2==0 else 0)
+
+    # Dark module
+    set_func(SIZE-8, 8, 1)
+
+    # Format info placeholders
+    fmt_pos = [(8,0),(8,1),(8,2),(8,3),(8,4),(8,5),(8,7),(8,8),
+               (7,8),(5,8),(4,8),(3,8),(2,8),(1,8),(0,8)]
+    fmt_pos2 = [(SIZE-1,8),(SIZE-2,8),(SIZE-3,8),(SIZE-4,8),(SIZE-5,8),(SIZE-6,8),(SIZE-7,8),
+                (8,SIZE-8),(8,SIZE-7),(8,SIZE-6),(8,SIZE-5),(8,SIZE-4),(8,SIZE-3),(8,SIZE-2),(8,SIZE-1)]
+    for (r,c) in fmt_pos+fmt_pos2:
+        if 0<=r<SIZE and 0<=c<SIZE: func[r][c]=True
+
+    # Alignment pattern (version 3: one at row=22,col=22)
+    def align(r,c):
+        for dr in range(-2,3):
+            for dc in range(-2,3):
+                v=1 if (abs(dr)==2 or abs(dc)==2) else (1 if dr==0 and dc==0 else 0)
+                set_func(r+dr,c+dc,v)
+    align(22,22)
+
+    # Place data bits (right-to-left column pairs, bottom-to-top)
+    bit_idx = 0
+    col = SIZE - 1
+    going_up = True
+    while col >= 0:
+        if col == 6: col -= 1  # skip timing column
+        cols = [col, col-1]
+        rows = range(SIZE-1,-1,-1) if going_up else range(SIZE)
+        for r in rows:
+            for c in cols:
+                if 0<=c<SIZE and not func[r][c]:
+                    if bit_idx < len(all_bits):
+                        mat[r][c] = all_bits[bit_idx]
+                    bit_idx += 1
+        going_up = not going_up
+        col -= 2
+
+    # Apply mask pattern 0 ((r+c)%2==0)
+    for r in range(SIZE):
+        for c in range(SIZE):
+            if not func[r][c] and (r+c)%2==0:
+                mat[r][c] ^= 1
+
+    # Format string for mask 0, ECC=M: 101010000010010 XOR 101010000010010... standard
+    # Precomputed format bits for M-level, mask 0: 101010000010010
+    fmt_bits = [1,0,1,0,1,0,0,0,0,0,1,0,0,1,0]
+    for i,(r,c) in enumerate(fmt_pos):
+        if 0<=r<SIZE and 0<=c<SIZE: mat[r][c]=fmt_bits[i]
+    for i,(r,c) in enumerate(fmt_pos2):
+        if 0<=r<SIZE and 0<=c<SIZE: mat[r][c]=fmt_bits[i]
+
+    # ── Render as SVG ─────────────────────────────────────────────────────────
+    cell = 5; border = 10
+    total = SIZE*cell + 2*border
+    rects = []
+    for r in range(SIZE):
+        for c in range(SIZE):
+            if mat[r][c]:
+                x = border + c*cell; y = border + r*cell
+                rects.append(f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="#f59e0b"/>')
+
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{total}" height="{total}">'
+           f'<rect width="{total}" height="{total}" fill="#0a0e1a"/>'
+           + "".join(rects) + "</svg>")
+    return svg
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 def inject_css():
@@ -509,11 +706,12 @@ def render_admin():
             """, unsafe_allow_html=True)
             st.code(ms["session_code"], language=None)
             try:
-                qr_img = generate_qr(url)
-                buf = io.BytesIO()
-                qr_img.save(buf, format="PNG")
-                buf.seek(0)
-                st.image(buf, caption="QR Code → URL Étudiants", width=160)
+                qr_svg = generate_qr_svg(url)
+                st.markdown(
+                    f'<div style="margin-top:8px">{qr_svg}</div>'
+                    f'<div style="font-size:10px;color:#6b7280;margin-top:4px;">QR Code → URL Étudiants</div>',
+                    unsafe_allow_html=True
+                )
             except Exception as e:
                 st.warning(f"QR Code indisponible : {e}")
             st.markdown("</div>", unsafe_allow_html=True)
